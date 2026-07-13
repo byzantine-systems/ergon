@@ -1,0 +1,39 @@
+name: "[Nix] Build & Test"
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    name: "[Lib] Check, Build and Test"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: wimpysworld/nothing-but-nix@main
+        with:
+          hatchet-protocol: 'cleave'
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      # To leverage devenv inside Github Actions
+      - uses: cachix/cachix-action@v17
+        with:
+          name: devenv
+
+      # TODO: Wait until sqruff properly supports GRAPH_TABLE (PG19)
+      # - name: "[Nix] Run treefmt to check Nix"
+      #   run: |
+      #     nix flake check
+
+      - name: "[Nix] Build"
+        run: |
+          nix build
