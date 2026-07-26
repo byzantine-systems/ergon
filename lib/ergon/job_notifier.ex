@@ -6,13 +6,16 @@ defmodule Ergon.JobNotifier do
 
   One instance runs per node. It opens a dedicated `Postgrex.Notifications`
   connection (auto-reconnecting) outside `Ergon.Repo`'s pool and `LISTEN`s on
-  the fixed channel `ergon_job_available`. The emitting half is the trigger
-  installed by `Ergon.Migration.job_notify_trigger/0`, which fires
-  `pg_notify('ergon_job_available', NEW.queue)` whenever a job becomes
-  immediately runnable (`available`, due, and live). On each notification the
-  payload is the **queue name only** (never job data or tenant), and the
-  notifier fans a `:wake` out to every worker registered for that queue via
-  `Ergon.WorkerRegistry`.
+  the fixed channel `ergon_job_available`. The emitting half is the pg_cron
+  tick installed by `Ergon.Migration.job_notify_cron/0`:
+  `ergon.notify_pending_jobs()` runs every second and fires
+  `pg_notify('ergon_job_available', queue)` once per queue holding an
+  immediately runnable job (`available`, due, and live). Writers never call
+  `pg_notify` themselves, a pending `NOTIFY` takes the global
+  notification-queue lock at commit and would serialize every enqueuing
+  transaction. On each notification the payload is the **queue name only**
+  (never job data or tenant), and the notifier fans a `:wake` out to every
+  worker registered for that queue via `Ergon.WorkerRegistry`.
 
   ## The poll is still the durable path
 
@@ -21,16 +24,19 @@ defmodule Ergon.JobNotifier do
   be lost. Workers keep their periodic fallback poll (`Ergon.Queue`'s
   `:poll_interval`), which alone drains everything correctly. That fallback is
   what covers the boot gap before the listener connects, any reconnect window,
-  and future-scheduled retries the trigger deliberately does not wake for. A
-  dropped or missed notification therefore costs latency, never a stuck job.
+  and every environment where pg_cron is not installed (there the tick never
+  runs and no NOTIFY ever fires). A dropped or missed notification therefore
+  costs latency, never a stuck job.
 
-  ## Coalescing and scheduled jobs (for free)
+  ## Coalescing, latency, and scheduled jobs
 
-  Postgres collapses duplicate `(channel, payload)` `NOTIFY`s within one
-  transaction, so a batch enqueue of 100 jobs onto one queue produces a single
-  wake. The trigger's `scheduled_at <= now()` guard means backoff/retry rows
-  scheduled in the future do not wake anyone early, they are picked up by the
-  fallback poll when they come due.
+  The tick emits at most one notification per queue per second regardless of
+  how many jobs are pending, so a batch enqueue of 100 jobs onto one queue
+  produces a single wake. The wake latency floor is the 1 s cron cadence
+  (versus commit-time with the old trigger design). Because the tick is
+  level-triggered on "runnable work exists", it keeps re-waking workers until
+  a queue is drained, and a future-scheduled backoff/retry row wakes its
+  workers on the first tick after `scheduled_at` passes, precisely when due.
 
   ## Configuration
 

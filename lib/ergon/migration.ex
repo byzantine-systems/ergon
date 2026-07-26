@@ -14,7 +14,7 @@ defmodule Ergon.Migration do
           versioning_trigger()
           bitemporal_table(:assets, "name text NOT NULL, state text NOT NULL DEFAULT 'idle'")
           pgmq_queue(:asset_events)
-          pgmq_notify_trigger(:asset_events)
+          pgmq_notify_cron(:asset_events)
         end
       end
 
@@ -347,131 +347,145 @@ defmodule Ergon.Migration do
   end
 
   @doc """
-  Installs an `AFTER INSERT` trigger on `pgmq.q_<queue>` that fires
-  `pg_notify(channel, '')` on every enqueued message, the emitting half of
-  `Ergon.Pgmq.Producer`'s `:notify_channel` LISTEN fast-path. Without this,
+  Installs the pg_cron notifier for a pgmq queue: a `pgmq_notify_<queue>()`
+  function that fires `pg_notify(channel, '')` whenever `pgmq.q_<queue>` holds
+  a *visible* message (`vt <= clock_timestamp()`), plus a 1 s pg_cron schedule
+  (`pgmq-notify-<queue>`) running it. This is the emitting half of
+  `Ergon.Pgmq.Producer`'s `:notify_channel` LISTEN fast-path. Without it,
   nothing ever calls `pg_notify` on that channel and the producer silently
-  falls back to polling on `:poll_interval` alone. The two only work together
-  once both sides are wired up.
+  falls back to polling on `:poll_interval` alone.
+
+  Deliberately **not** an insert trigger: a transaction with a pending
+  `NOTIFY` takes the global notification-queue lock at commit, so
+  trigger-emitted notifications serialize every enqueuing commit (the
+  LISTEN/NOTIFY scalability trap). With the cron tick, producers never call
+  `pg_notify`, only the tick's own transaction does, and the tick is
+  level-triggered: it re-notifies as long as deliverable work exists, which
+  also wakes consumers when a visibility timeout expires (redelivery),
+  something an insert trigger never did.
 
   `channel` defaults to `pgmq_<queue>`, matching the convention documented on
   `Ergon.Pgmq.Producer`. No payload is sent (`pg_notify(channel, '')`), by
   design, listeners are expected to poll pgmq themselves rather than trust
   the notification payload, matching pgmq's own at-least-once contract (a
-  dropped `NOTIFY` only costs latency, never a missed message). Firing
-  `pg_notify` from inside the trigger is safe with respect to rolled-back
-  work: Postgres only delivers a `NOTIFY` once its transaction commits, so an
-  aborted `pgmq.send` never wakes a listener for a message that doesn't
-  exist.
+  dropped `NOTIFY` only costs latency, never a missed message).
 
-  Triggers on the table Postgres uses for the queue rather than requiring
-  every caller of `pgmq.send` to remember to notify, any inserter (raw SQL,
-  another app, a future pgmq version) gets the wake-up for free.
+  Where pg_cron is absent (test DB, cron-less clusters) the schedule is a
+  guarded no-op (`Ergon.Cron.schedule/3`) and the producer's `:poll_interval`
+  loop is the only wake path, still fully correct, only slower.
 
-  Reversible in `change/0` (the function and trigger have no meaningful
-  partial `down` beyond `DROP`, same rationale as the other DDL helpers here).
+  The function DDL is reversible in `change/0` (its `down` drops the
+  function). The cron schedule is not (`Ergon.Cron.schedule/3` is
+  `execute/1`-style), call `Ergon.Cron.unschedule("pgmq-notify-<queue>")`
+  from an explicit `down/0` when reversibility matters.
   """
-  @spec pgmq_notify_trigger(atom() | String.t(), keyword()) :: :ok
-  def pgmq_notify_trigger(queue, opts \\ []) when is_atom(queue) or is_binary(queue) do
-    for sql <- pgmq_notify_trigger_sql(queue, opts), do: Ecto.Migration.execute(sql)
+  @spec pgmq_notify_cron(atom() | String.t(), keyword()) :: :ok
+  def pgmq_notify_cron(queue, opts \\ []) when is_atom(queue) or is_binary(queue) do
+    name = validate_identifier!(queue, "queue")
+    fn_name = "pgmq_notify_#{name}"
+
+    Ecto.Migration.execute(
+      hd(pgmq_notify_cron_sql(queue, opts)),
+      "DROP FUNCTION IF EXISTS #{fn_name}()"
+    )
+
+    Ergon.Cron.schedule("pgmq-notify-#{name}", "1 second", "SELECT #{fn_name}()")
     :ok
   end
 
   @doc false
-  # Returns the SQL statements `pgmq_notify_trigger/2` would execute, in
-  # order. Exposed for testing, the migration-execute form can only run
-  # inside a live `Ecto.Migration.Runner`, same reason `bitemporal_table_sql/2`
-  # and friends exist.
-  @spec pgmq_notify_trigger_sql(atom() | String.t(), keyword()) :: [String.t()]
-  def pgmq_notify_trigger_sql(queue, opts \\ []) when is_atom(queue) or is_binary(queue) do
+  # Returns the SQL statements `pgmq_notify_cron/2` would execute (the
+  # function DDL, the cron schedule is a migration-only side effect, same
+  # shape as `partitioned_table/2`). Exposed for testing, the
+  # migration-execute form can only run inside a live `Ecto.Migration.Runner`,
+  # same reason `bitemporal_table_sql/2` and friends exist.
+  @spec pgmq_notify_cron_sql(atom() | String.t(), keyword()) :: [String.t()]
+  def pgmq_notify_cron_sql(queue, opts \\ []) when is_atom(queue) or is_binary(queue) do
     name = validate_identifier!(queue, "queue")
     channel = opts |> Keyword.get(:channel, "pgmq_#{name}") |> validate_identifier!("channel")
     fn_name = "pgmq_notify_#{name}"
 
     [
       """
-      CREATE OR REPLACE FUNCTION #{fn_name}() RETURNS trigger
+      CREATE OR REPLACE FUNCTION #{fn_name}() RETURNS void
       LANGUAGE plpgsql AS $$
       BEGIN
-        PERFORM pg_notify('#{channel}', '');
-        RETURN NEW;
+        IF EXISTS (SELECT 1 FROM pgmq.q_#{name} WHERE vt <= clock_timestamp()) THEN
+          PERFORM pg_notify('#{channel}', '');
+        END IF;
       END
       $$
-      """,
-      """
-      CREATE TRIGGER #{fn_name}_trigger
-        AFTER INSERT ON pgmq.q_#{name}
-        FOR EACH ROW EXECUTE FUNCTION #{fn_name}()
       """
     ]
   end
 
   @doc """
-  Installs the wake-up trigger on `ergon.jobs` for `Ergon.JobNotifier`.
+  Installs the pg_cron wake-up tick on `ergon.jobs` for `Ergon.JobNotifier`.
 
-  Emits an `AFTER INSERT OR UPDATE` trigger firing
-  `pg_notify('#{Ergon.JobNotifier.channel()}', NEW.queue)` **only** when the
-  row is immediately runnable, `available`, due (`scheduled_at <= now()`), and
-  live (`upper(valid_period) = 'infinity'`). The payload is the queue name
-  alone, never job payload or `tenant` (`NOTIFY` bypasses RLS, so the channel
-  is visible to any session on the database, the queue name is the only thing
-  exposed). `Ergon.JobNotifier` routes on that payload to wake the workers
-  draining that queue.
+  Emits the `ergon.notify_pending_jobs()` function, which fires
+  `pg_notify('#{Ergon.JobNotifier.channel()}', queue)` once per queue holding
+  an immediately runnable job, `available`, due (`scheduled_at <= now()`), and
+  live (`upper(valid_period) = 'infinity'`, the exact predicate of
+  `jobs_fetch_idx`), then schedules it every second as the pg_cron job
+  `ergon-job-notify`. The payload is the queue name alone, never job payload
+  or `tenant` (`NOTIFY` bypasses RLS, so the channel is visible to any session
+  on the database, the queue name is the only thing exposed).
+  `Ergon.JobNotifier` routes on that payload to wake the workers draining that
+  queue.
 
-  This is the native-`ergon.jobs` mirror of `pgmq_notify_trigger/2`. It is
+  Deliberately **not** a trigger on `ergon.jobs`: a transaction with a
+  pending `NOTIFY` takes the global notification-queue lock at commit, so a
+  trigger would serialize every enqueuing commit (the LISTEN/NOTIFY
+  scalability trap). `ergon.jobs` is the outbox, and only the tick's own
+  transaction ever notifies. The tick is level-triggered, it keeps waking
+  workers as long as runnable work exists, so a lost wake self-heals within a
+  second, and future-scheduled retries notify exactly when they come due
+  (something the trigger's `scheduled_at <= now()` guard could never do).
+
+  This is the native-`ergon.jobs` mirror of `pgmq_notify_cron/2`. It is
   shipped by ergon's own initial migration (`ergon.jobs` is ergon's table, not
   a host concern like pgmq queues), and exposed here for parity and so a host
   that rebuilds the schema can reinstall it.
 
-  Why the guard matters:
-
-    * **Only runnable rows wake.** A checkout (`available → executing`) sets
-      `NEW.state = 'executing'`, so it never fires. A backoff retry scheduled
-      in the future has `scheduled_at > now()`, so it does not wake anyone
-      early, the fallback poll picks it up when due.
-    * **Commit semantics come free.** Postgres delivers a `NOTIFY` only once
-      its transaction commits, so a rolled-back enqueue never wakes a worker,
-      and a multi-row batch enqueue on one queue coalesces to a single wake
-      (Postgres dedups `(channel, payload)` within a transaction).
-
-  Idempotent (`CREATE OR REPLACE FUNCTION`), the trigger is created plain, so
-  reinstalling against a schema that already has it needs a `DROP TRIGGER`
-  first (the initial migration installs it exactly once).
+  Where pg_cron is absent the schedule is a guarded no-op and workers rely on
+  their fallback poll (`Ergon.Queue`'s `:poll_interval`) alone, still fully
+  correct, only slower. Idempotent: `CREATE OR REPLACE FUNCTION` plus
+  `cron.schedule`'s upsert-by-name.
   """
-  @spec job_notify_trigger() :: :ok
-  def job_notify_trigger do
-    for sql <- job_notify_trigger_sql(), do: Ecto.Migration.execute(sql)
+  @spec job_notify_cron() :: :ok
+  def job_notify_cron do
+    for sql <- job_notify_cron_sql(), do: Ecto.Migration.execute(sql)
+
+    Ergon.Cron.schedule(
+      "ergon-job-notify",
+      "1 second",
+      "SELECT ergon.notify_pending_jobs()"
+    )
+
     :ok
   end
 
   @doc false
-  # Returns the SQL statements `job_notify_trigger/0` would execute, in order
-  # (function DDL, then the guarded trigger). Exposed for testing, same reason
-  # as pgmq_notify_trigger_sql/2.
-  @spec job_notify_trigger_sql() :: [String.t()]
-  def job_notify_trigger_sql do
+  # Returns the SQL statements `job_notify_cron/0` would execute (the function
+  # DDL, the cron schedule is a migration-only side effect, same shape as
+  # `partitioned_table/2`). Exposed for testing, same reason as
+  # pgmq_notify_cron_sql/2.
+  @spec job_notify_cron_sql() :: [String.t()]
+  def job_notify_cron_sql do
     channel = Ergon.JobNotifier.channel()
 
     [
       """
-      CREATE OR REPLACE FUNCTION ergon.job_notify() RETURNS trigger
-      LANGUAGE plpgsql AS $$
-      BEGIN
-        PERFORM pg_notify('#{channel}', NEW.queue);
-        RETURN NEW;
-      END
+      CREATE OR REPLACE FUNCTION ergon.notify_pending_jobs() RETURNS integer
+      LANGUAGE sql AS $$
+        SELECT count(pg_notify('#{channel}', q.queue))::integer
+        FROM (
+          SELECT DISTINCT queue FROM ergon.jobs
+          WHERE state = 'available'
+            AND scheduled_at <= now()
+            AND upper(valid_period) = 'infinity'
+        ) AS q
       $$
-      """,
-      """
-      CREATE TRIGGER jobs_notify_trigger
-        AFTER INSERT OR UPDATE ON ergon.jobs
-        FOR EACH ROW
-        WHEN (
-          NEW.state = 'available'
-          AND NEW.scheduled_at <= now()
-          AND upper(NEW.valid_period) = 'infinity'
-        )
-        EXECUTE FUNCTION ergon.job_notify()
       """
     ]
   end

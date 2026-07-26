@@ -16,12 +16,14 @@ defmodule Ergon.Pgmq.Producer do
   data and may be lost freely, pgmq is the durable buffer, so a dropped
   `NOTIFY` costs latency, never events.
 
-  Something still has to call `pg_notify` when a message lands, that's
-  `Ergon.Migration.pgmq_notify_trigger/2`, which installs a trigger on
-  `pgmq.q_<queue>` firing on every insert, regardless of what inserted it.
-  Without running that migration helper, `:notify_channel` has nothing to
-  listen for and the producer just polls on `:poll_interval` the whole time
-  (still correct, just not fast).
+  Something still has to call `pg_notify` when a message is deliverable,
+  that's `Ergon.Migration.pgmq_notify_cron/2`, which installs a per-second
+  pg_cron tick notifying whenever `pgmq.q_<queue>` holds a visible message,
+  regardless of what inserted it (writers never notify, see that helper's
+  docs for why a trigger would serialize enqueuing commits). Without running
+  that migration helper, or on a database without pg_cron, `:notify_channel`
+  has nothing to listen for and the producer just polls on `:poll_interval`
+  the whole time (still correct, just not fast).
 
   ## Options
 
@@ -32,7 +34,7 @@ defmodule Ergon.Pgmq.Producer do
     * `:visibility_timeout`, seconds a read message stays hidden (default 30)
     * `:notify_channel`, optional LISTEN channel for the wake-up fast path
       (convention: `pgmq_<queue>`, installed by
-      `Ergon.Migration.pgmq_notify_trigger/2`)
+      `Ergon.Migration.pgmq_notify_cron/2`)
 
   ## A note on connection poolers
 

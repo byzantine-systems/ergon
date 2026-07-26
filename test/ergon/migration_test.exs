@@ -44,24 +44,22 @@ defmodule Ergon.MigrationTest do
     end
   end
 
-  describe "job_notify_trigger_sql/0" do
-    test "returns two statements: the notify function, then the guarded trigger" do
-      sqls = Ergon.Migration.job_notify_trigger_sql()
+  describe "job_notify_cron_sql/0" do
+    test "returns the tick function only, no trigger (writers never NOTIFY)" do
+      sqls = Ergon.Migration.job_notify_cron_sql()
 
-      assert length(sqls) == 2
+      assert [func] = sqls
 
       # Payload is the queue name only (never job data or tenant, NOTIFY
-      # bypasses RLS).
-      assert Enum.at(sqls, 0) =~ "CREATE OR REPLACE FUNCTION ergon.job_notify()"
-      assert Enum.at(sqls, 0) =~ "pg_notify('#{Ergon.JobNotifier.channel()}', NEW.queue)"
+      # bypasses RLS), and the predicate matches jobs_fetch_idx exactly.
+      assert func =~ "CREATE OR REPLACE FUNCTION ergon.notify_pending_jobs()"
+      assert func =~ "pg_notify('#{Ergon.JobNotifier.channel()}', q.queue)"
+      assert func =~ "SELECT DISTINCT queue FROM ergon.jobs"
+      assert func =~ "state = 'available'"
+      assert func =~ "scheduled_at <= now()"
+      assert func =~ "upper(valid_period) = 'infinity'"
 
-      trigger = Enum.at(sqls, 1)
-      assert trigger =~ "CREATE TRIGGER jobs_notify_trigger"
-      assert trigger =~ "AFTER INSERT OR UPDATE ON ergon.jobs"
-      assert trigger =~ "NEW.state = 'available'"
-      assert trigger =~ "NEW.scheduled_at <= now()"
-      assert trigger =~ "upper(NEW.valid_period) = 'infinity'"
-      assert trigger =~ "EXECUTE FUNCTION ergon.job_notify()"
+      refute func =~ "CREATE TRIGGER"
     end
   end
 
@@ -193,62 +191,60 @@ defmodule Ergon.MigrationTest do
     end
   end
 
-  describe "pgmq_notify_trigger_sql/2" do
-    test "returns two statements: the notify function, then the trigger" do
-      sqls = Ergon.Migration.pgmq_notify_trigger_sql(:asset_events)
+  describe "pgmq_notify_cron_sql/2" do
+    test "returns the tick function only, guarded on a visible message" do
+      sqls = Ergon.Migration.pgmq_notify_cron_sql(:asset_events)
 
-      assert length(sqls) == 2
-      assert Enum.at(sqls, 0) =~ "CREATE OR REPLACE FUNCTION pgmq_notify_asset_events()"
-      assert Enum.at(sqls, 0) =~ "pg_notify('pgmq_asset_events', '')"
-      assert Enum.at(sqls, 1) =~ "CREATE TRIGGER pgmq_notify_asset_events_trigger"
-      assert Enum.at(sqls, 1) =~ "AFTER INSERT ON pgmq.q_asset_events"
-      assert Enum.at(sqls, 1) =~ "EXECUTE FUNCTION pgmq_notify_asset_events()"
+      assert [func] = sqls
+      assert func =~ "CREATE OR REPLACE FUNCTION pgmq_notify_asset_events()"
+      assert func =~ "SELECT 1 FROM pgmq.q_asset_events WHERE vt <= clock_timestamp()"
+      assert func =~ "pg_notify('pgmq_asset_events', '')"
+
+      refute func =~ "CREATE TRIGGER"
     end
 
     test "a :channel override replaces the pgmq_<queue> default" do
-      sqls = Ergon.Migration.pgmq_notify_trigger_sql(:asset_events, channel: "custom_chan")
+      sqls = Ergon.Migration.pgmq_notify_cron_sql(:asset_events, channel: "custom_chan")
 
       assert Enum.at(sqls, 0) =~ "pg_notify('custom_chan', '')"
     end
 
     test "rejects a queue name with characters outside [a-z0-9_]" do
       assert_raise ArgumentError, ~r/invalid queue name/, fn ->
-        Ergon.Migration.pgmq_notify_trigger_sql("bad; drop table x --")
+        Ergon.Migration.pgmq_notify_cron_sql("bad; drop table x --")
       end
     end
 
     test "rejects a channel override with unsafe characters" do
       assert_raise ArgumentError, ~r/invalid channel name/, fn ->
-        Ergon.Migration.pgmq_notify_trigger_sql(:asset_events, channel: "bad-channel!")
+        Ergon.Migration.pgmq_notify_cron_sql(:asset_events, channel: "bad-channel!")
       end
     end
 
     @tag :integration
-    test "executing the statements installs a working notify trigger on the queue table" do
+    test "executing the statements installs a working tick function for the queue" do
       queue = "notify_test_#{System.unique_integer([:positive])}"
       {:ok, _} = Repo.query("SELECT pgmq.create($1)", [queue])
 
-      for sql <- Ergon.Migration.pgmq_notify_trigger_sql(queue),
+      for sql <- Ergon.Migration.pgmq_notify_cron_sql(queue),
           do: {:ok, _} = Repo.query(sql)
-
-      assert {:ok, %Postgrex.Result{rows: [[1]]}} =
-               Repo.query(
-                 "SELECT 1 FROM pg_trigger WHERE tgname = $1",
-                 ["pgmq_notify_#{queue}_trigger"]
-               )
 
       assert {:ok, %Postgrex.Result{rows: [[funcdef]]}} =
                Repo.query("SELECT pg_get_functiondef('pgmq_notify_#{queue}'::regproc)")
 
       assert funcdef =~ "pg_notify('pgmq_#{queue}', '')"
 
-      # NOTIFY only delivers on commit, the sandbox transaction never
-      # commits, so we can't observe an actual notification here (see
-      # Ergon.Pgmq.ProducerTest's own note on the same limitation). Enqueuing
-      # without error is as far as this test can verify the trigger fires
-      # without raising.
+      # NOTIFY only delivers on commit, the sandbox transaction never commits,
+      # so we can't observe an actual notification here (see
+      # Ergon.Pgmq.ProducerTest's own note on the same limitation). Running
+      # the tick without error on both the empty and the non-empty queue is as
+      # far as this test can verify.
+      assert {:ok, _} = Repo.query("SELECT pgmq_notify_#{queue}()")
+
       assert {:ok, %Postgrex.Result{rows: [[_msg_id]]}} =
                Repo.query("SELECT pgmq.send($1, $2)", [queue, %{"probe" => true}])
+
+      assert {:ok, _} = Repo.query("SELECT pgmq_notify_#{queue}()")
     end
   end
 end
