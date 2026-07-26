@@ -14,4 +14,6 @@ SELECT
     last_error,
     scheduled_at,
     inserted_at
-FROM ergon.jobs_asof($1);
+FROM
+    ergon.jobs_asof ($1);
+

@@ -4,14 +4,10 @@
 -- Returns YYYYMM labels, empty when healthy.
 -- $1: months ahead to verify
 -- $2: parent table name
-SELECT to_char(months.month_start, 'YYYYMM') AS missing_month
+SELECT
+    TO_CHAR(months.month_start, 'YYYYMM') AS missing_month
 FROM
-    generate_series(
-        date_trunc('month', now()),
-        date_trunc('month', now()) + make_interval(months => $1),
-        INTERVAL '1 month'
-    ) AS months (month_start)
+    GENERATE_SERIES(DATE_TRUNC('month', NOW()), DATE_TRUNC('month', NOW()) + MAKE_INTERVAL(months => $1), INTERVAL '1 month') AS months (month_start)
 WHERE
-    to_regclass(
-        $2 || '_' || to_char(months.month_start, 'YYYYMM')
-    ) IS NULL;
+    TO_REGCLASS($2 || '_' || TO_CHAR(months.month_start, 'YYYYMM')) IS NULL;
+

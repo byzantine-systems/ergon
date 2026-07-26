@@ -9,4 +9,6 @@ SELECT
     msg_id,
     read_ct,
     message
-FROM pgmq.read($1, $2, $3);
+FROM
+    pgmq.read ($1, $2, $3);
+

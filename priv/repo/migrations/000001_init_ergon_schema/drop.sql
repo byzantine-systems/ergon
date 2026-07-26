@@ -10,8 +10,9 @@ DROP PROPERTY GRAPH IF EXISTS ergon.workflow;
 
 DROP SCHEMA IF EXISTS ergon CASCADE;
 
-DROP FUNCTION IF EXISTS pgmq_release_leases(text);
-DROP FUNCTION IF EXISTS temporal_versioning();
+DROP FUNCTION IF EXISTS pgmq_release_leases (text);
+
+DROP FUNCTION IF EXISTS temporal_versioning ();
 
 -- Extension drops (btree_gist, pgcrypto, pgmq, pg_cron) are intentionally not
 -- mirrored, they may serve other databases/apps and are cheap to leave.
