@@ -10,9 +10,10 @@ defmodule Ergon.Worker do
 
   The periodic poll is the reliable fallback. On init a worker also registers
   in `Ergon.WorkerRegistry` under its queue name, so `Ergon.JobNotifier` can
-  send it a `:wake` the moment a job lands and it drains immediately rather than
-  waiting out `poll_interval`. With the notifier disabled or a wake lost, the
-  fallback poll still drains everything, only later.
+  send it a `:wake` within a tick of a job becoming runnable and it drains
+  immediately rather than waiting out `poll_interval`. With the notifier
+  disabled, pg_cron absent, or a wake lost, the fallback poll still drains
+  everything, only later.
   """
   use GenServer
 

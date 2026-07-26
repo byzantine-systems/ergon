@@ -2,8 +2,8 @@
 -- reads top-to-bottom here. Loaded by Ergon.Repo.Migrations.InitErgonSchema,
 -- which splits this script on semicolons and executes each statement in order
 -- (Postgrex runs one statement per query). Keep this file free of dollar-quoted
--- ($$) bodies so the simple split stays correct. The plpgsql functions
--- (temporal_versioning, enforce_job_transition, job_notify, enqueue,
+-- ($$) bodies so the simple split stays correct. The plpgsql/sql functions
+-- (temporal_versioning, enforce_job_transition, notify_pending_jobs, enqueue,
 -- pgmq_release_leases, jobs_asof*) are installed from the migration module
 -- instead.
 --
@@ -131,22 +131,14 @@ CREATE TRIGGER jobs_transition_guard
 BEFORE UPDATE ON ergon.jobs
 FOR EACH ROW EXECUTE FUNCTION ergon.enforce_job_transition();
 
--- Reactive wake-up for Ergon.JobNotifier: fire pg_notify on the 
--- fixed channel with the queue name whenever a row becomes 
--- immediately runnable (available + due + live). 
--- Checkout (-> executing) and future-scheduled retries are guarded
--- out, so only rows a worker could claim right now wake anyone. 
--- ergon.job_notify has a $$ body and so is installed from the 
--- migration module.
-CREATE TRIGGER jobs_notify_trigger
-AFTER INSERT OR UPDATE ON ergon.jobs
-FOR EACH ROW
-WHEN (
-NEW.state = 'available'
-AND NEW.scheduled_at <= now()
-AND upper(NEW.valid_period) = 'infinity'
-)
-EXECUTE FUNCTION ergon.job_notify();
+-- Reactive wake-ups for Ergon.JobNotifier are NOT a trigger here. Writers
+-- never call pg_notify: every transaction with a pending NOTIFY takes the
+-- global notification-queue lock at commit, serializing all notifying
+-- commits (the LISTEN/NOTIFY scalability trap). Instead a pg_cron tick runs
+-- ergon.notify_pending_jobs() every second, which notifies once per queue
+-- that has immediately runnable work (available + due + live). The function
+-- has a $$ body and so is installed from the migration module, which also
+-- schedules the tick via Ergon.Cron.
 
 -- Opt-in multi-tenant isolation. Enabled+FORCED so it applies even to the table
 -- owner, but the policy is a no-op when the `ergon.tenant` GUC is unset, so

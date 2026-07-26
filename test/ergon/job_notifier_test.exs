@@ -1,7 +1,9 @@
 defmodule Ergon.JobNotifierTest do
-  # Exercises the LISTEN/NOTIFY wake-up path end to end: the trigger on
-  # ergon.jobs firing pg_notify, and Ergon.JobNotifier routing the payload's
-  # queue to the workers registered for it.
+  # Exercises the LISTEN/NOTIFY wake-up path end to end: the
+  # ergon.notify_pending_jobs() tick function firing pg_notify per queue with
+  # runnable work (pg_cron runs it every second in production, tests call it
+  # directly, the test DB has no pg_cron), and Ergon.JobNotifier routing the
+  # payload's queue to the workers registered for it.
   #
   # NOTIFY only delivers once the emitting transaction commits, so unlike the
   # rest of the suite these tests do NOT run inside the SQL sandbox. They use a
@@ -69,8 +71,8 @@ defmodule Ergon.JobNotifierTest do
     end
   end
 
-  describe "trigger → NOTIFY (committed, end to end)" do
-    test "an enqueued runnable job notifies with the queue name", %{
+  describe "notify_pending_jobs() → NOTIFY (committed, end to end)" do
+    test "a runnable job notifies with the queue name, once per queue", %{
       conn: conn,
       conn_opts: conn_opts,
       prefix: prefix
@@ -78,19 +80,31 @@ defmodule Ergon.JobNotifierTest do
       {:ok, notif} = Postgrex.Notifications.start_link(conn_opts)
       listen!(notif, JobNotifier.channel())
 
-      queue = "#{prefix}_run"
+      queue_a = "#{prefix}_run_a"
+      queue_b = "#{prefix}_run_b"
 
-      {:ok, _} =
-        Postgrex.query(conn, "INSERT INTO ergon.jobs (queue, worker) VALUES ($1, $2)", [
-          queue,
-          "w"
-        ])
+      # Several runnable jobs on queue_a, one on queue_b. The tick notifies
+      # once per queue with runnable work (DISTINCT queue), not per job.
+      for {q, n} <- [{queue_a, 3}, {queue_b, 1}], _ <- 1..n do
+        {:ok, _} =
+          Postgrex.query(conn, "INSERT INTO ergon.jobs (queue, worker) VALUES ($1, $2)", [q, "w"])
+      end
 
-      assert_receive {:notification, _pid, _ref, channel, ^queue}, 2000
-      assert channel == JobNotifier.channel()
+      # In production pg_cron runs this every second, here we invoke the tick
+      # directly. It reports how many queues it notified (at least our two,
+      # committed leftovers from a concurrent test file may add more).
+      %Postgrex.Result{rows: [[notified]]} =
+        Postgrex.query!(conn, "SELECT ergon.notify_pending_jobs()", [])
+
+      assert notified >= 2
+
+      channel = JobNotifier.channel()
+      assert_receive {:notification, _pid, _ref, ^channel, ^queue_a}, 2000
+      assert_receive {:notification, _pid, _ref, ^channel, ^queue_b}, 2000
+      refute_receive {:notification, _pid, _ref, _channel, ^queue_a}, 300
     end
 
-    test "a future-scheduled job does NOT notify (the guard holds)", %{
+    test "a future-scheduled job does NOT notify (the predicate holds)", %{
       conn: conn,
       conn_opts: conn_opts,
       prefix: prefix
@@ -107,9 +121,11 @@ defmodule Ergon.JobNotifierTest do
           [future, "w"]
         )
 
-      # The trigger's `scheduled_at <= now()` guard means a backoff/retry row
-      # scheduled in the future wakes no one, the fallback poll picks it up when
-      # it comes due.
+      # The tick's `scheduled_at <= now()` predicate means a backoff/retry row
+      # scheduled in the future wakes no one until it comes due, then the next
+      # tick (or the fallback poll) picks it up.
+      {:ok, _} = Postgrex.query(conn, "SELECT ergon.notify_pending_jobs()", [])
+
       refute_receive {:notification, _pid, _ref, _channel, ^future}, 500
     end
   end

@@ -20,9 +20,9 @@ defmodule Ergon.Repo.Migrations.InitErgonSchema do
   free of dollar-quoted (`$$`) bodies, the plpgsql functions are installed as
   single `execute/1` statements from here, before the schema when a trigger in
   `create.sql` references them (`temporal_versioning/0` via
-  `Ergon.Migration.versioning_trigger/0`, `ergon.enforce_job_transition/0`, and
-  `ergon.job_notify/0` for the `Ergon.JobNotifier` wake-up trigger),
-  after it otherwise (`ergon.enqueue`, `pgmq_release_leases`, `ergon.jobs_asof*`).
+  `Ergon.Migration.versioning_trigger/0` and `ergon.enforce_job_transition/0`),
+  after it otherwise (`ergon.notify_pending_jobs` for the `Ergon.JobNotifier`
+  wake-up tick, `ergon.enqueue`, `pgmq_release_leases`, `ergon.jobs_asof*`).
   Once applied, treat the paired `.sql` + `.exs` as immutable (Ecto tracks
   migrations by version, not content).
   """
@@ -66,24 +66,39 @@ defmodule Ergon.Repo.Migrations.InitErgonSchema do
     $$
     """)
 
-    # Wake-up trigger function for Ergon.JobNotifier (attached as an AFTER
-    # INSERT OR UPDATE trigger in create.sql, guarded to runnable rows, so it
-    # must exist first). Fires pg_notify on the fixed channel with the queue
-    # name only, the payload is never job data or tenant (NOTIFY bypasses RLS).
-    # Reusable half packaged as Ergon.Migration.job_notify_trigger/0 for parity
-    # with pgmq_notify_trigger/2, here we install just the function ($$ body),
-    # create.sql owns the guarded trigger attachment.
+    execute_sql_file(sql_path("create.sql"))
+
+    # Wake-up tick for Ergon.JobNotifier. Writers never call pg_notify (a
+    # pending NOTIFY takes the global notification-queue lock at commit,
+    # serializing all notifying transactions), instead this function notifies
+    # once per queue that has immediately runnable work (available + due +
+    # live, the exact predicate of jobs_fetch_idx) and pg_cron runs it every
+    # second. The payload is the queue name only, never job data or tenant
+    # (NOTIFY bypasses RLS). Reusable half packaged as
+    # Ergon.Migration.job_notify_cron/0 for parity with pgmq_notify_cron/2.
+    # Installed here (not create.sql) because of the $$ body, and after
+    # create.sql because the SQL body references ergon.jobs.
     execute("""
-    CREATE FUNCTION ergon.job_notify() RETURNS trigger
-    LANGUAGE plpgsql AS $$
-    BEGIN
-      PERFORM pg_notify('#{Ergon.JobNotifier.channel()}', NEW.queue);
-      RETURN NEW;
-    END
+    CREATE FUNCTION ergon.notify_pending_jobs() RETURNS integer
+    LANGUAGE sql AS $$
+      SELECT count(pg_notify('#{Ergon.JobNotifier.channel()}', q.queue))::integer
+      FROM (
+        SELECT DISTINCT queue FROM ergon.jobs
+        WHERE state = 'available'
+          AND scheduled_at <= now()
+          AND upper(valid_period) = 'infinity'
+      ) AS q
     $$
     """)
 
-    execute_sql_file(sql_path("create.sql"))
+    # The 1 s notifier tick. Guarded no-op where pg_cron is absent (test DB,
+    # cron-less host clusters), there the workers' fallback poll is the only
+    # wake path, which is fully correct, only slower.
+    Ergon.Cron.schedule(
+      "ergon-job-notify",
+      "1 second",
+      "SELECT ergon.notify_pending_jobs()"
+    )
 
     # ergon.enqueue: get-or-create insert. Inserts the job and, on the temporal
     # uniqueness EXCLUDE violation, returns the existing live overlapping job
@@ -164,8 +179,13 @@ defmodule Ergon.Repo.Migrations.InitErgonSchema do
   end
 
   def down do
+    # The notifier tick goes first, cron.job rows are not dropped by the
+    # schema CASCADE below (guarded no-op where pg_cron is absent).
+    Ergon.Cron.unschedule("ergon-job-notify")
+
     # drop.sql drops the ergon schema CASCADE (taking enqueue, jobs_asof*,
-    # enforce_job_transition with it) plus the public-schema functions.
+    # notify_pending_jobs, enforce_job_transition with it) plus the
+    # public-schema functions.
     execute_sql_file(sql_path("drop.sql"))
 
     # Extension drops are intentionally not mirrored, pgmq/pg_cron may serve

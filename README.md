@@ -1,7 +1,8 @@
 # Ergon
 
-[![Built with Nix](https://builtwithnix.org/badge.svg)](https://builtwithnix.org)
 [![[Nix] Build & Test](https://github.com/byzantine-systems/ergon/actions/workflows/build.yml/badge.svg)](https://github.com/byzantine-systems/ergon/actions/workflows/build.yml)
+[![Built with Nix](https://builtwithnix.org/badge.svg)](https://builtwithnix.org)
+![License](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)
 
 > [!WARNING]
 > This project is under active development. Avoid using it for production apps.
