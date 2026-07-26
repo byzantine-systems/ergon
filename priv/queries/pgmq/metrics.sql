@@ -7,4 +7,6 @@ SELECT
     queue_length,
     queue_visible_length,
     oldest_msg_age_sec
-FROM pgmq.metrics($1);
+FROM
+    pgmq.metrics ($1);
+

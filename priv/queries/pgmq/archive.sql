@@ -7,5 +7,8 @@
 -- resolve at prepare time.
 -- $1: queue name
 -- $2: message ids
-SELECT archived.msg_id
-FROM pgmq.archive($1, $2::bigint []) AS archived (msg_id);
+SELECT
+    archived.msg_id
+FROM
+    pgmq.archive ($1, $2::bigint[]) AS archived (msg_id);
+

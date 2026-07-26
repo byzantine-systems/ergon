@@ -4,4 +4,6 @@
 -- timeouts, the reconciler frees them all. Returns the number of leases
 -- released.
 -- $1: queue name
-SELECT pgmq_release_leases($1) AS released;
+SELECT
+    pgmq_release_leases ($1) AS released;
+

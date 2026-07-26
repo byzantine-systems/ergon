@@ -4,7 +4,7 @@ defmodule Ergon.MixProject do
   def project do
     [
       app: :ergon,
-      version: "0.1.0",
+      version: "0.2.0",
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
@@ -25,7 +25,19 @@ defmodule Ergon.MixProject do
     [
       main: "readme",
       # logo: "path/to/logo.png",
-      extras: ["README.md"]
+      extras: [
+        "README.md",
+        "examples/getting-started.md",
+        "examples/unique-jobs.md",
+        "examples/workflows.md",
+        "examples/pgmq-broadway.md",
+        "examples/migrations.md",
+        "examples/scheduling.md",
+        "examples/operations.md"
+      ],
+      groups_for_extras: [
+        Guides: Path.wildcard("examples/*.md")
+      ]
     ]
   end
 
@@ -72,7 +84,7 @@ defmodule Ergon.MixProject do
     [
       licenses: ["LGPL-3.0-only"],
       links: %{"GitHub" => "https://github.com/byzantine-systems/ergon"},
-      files: ~w(lib priv/queries priv/repo mix.exs README.md)
+      files: ~w(lib priv/queries priv/repo mix.exs README.md examples)
     ]
   end
 end

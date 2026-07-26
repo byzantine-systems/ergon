@@ -47,8 +47,16 @@
           ...
         }:
         let
+          mixConfig = builtins.readFile ./mix.exs;
+          stripped = pkgs.lib.replaceStrings [ " " "\t" "\n" "\r" ] [ "" "" "" "" ] mixConfig;
+          # mix.exs declares `version: "x.y.z"` in project/0; once whitespace is
+          # stripped that reads `version:"x.y.z"`. builtins.match anchors on the
+          # whole string, so the surrounding `.*` swallow everything else and the
+          # sole capture group is the version. Bracket expressions keep the
+          # literal `:` / `"` unambiguous under POSIX ERE.
+          m = builtins.match ''.*version:"([^"]+)".*'' stripped;
           app_name = "ergon";
-          app_version = "0.1.0";
+          app_version = builtins.elemAt m 0;
 
           # nixpkgs' pg_cron (1.6.7) fails to compile against the PG19
           # server headers with -Wtypedef-redefinition. Upstream commit
@@ -103,7 +111,21 @@
             projectRootFile = "flake.nix";
             programs = {
               nixfmt.enable = true;
-              sqruff.enable = true;
+            };
+
+            # pgFormatter ships no treefmt-nix `programs.*` wrapper, so register
+            # it as a custom formatter. pg_format formats many files in one call
+            # as long as `--inplace` is set, which matches how treefmt invokes a
+            # formatter (matched files appended as trailing arguments).
+            # https://github.com/numtide/treefmt-nix#using-a-custom-formatter
+            settings.formatter.pg_format = {
+              command = "${pkgs.pgformatter}/bin/pg_format";
+              options = [
+                "--inplace"
+                "-f"
+                "2"
+              ];
+              includes = [ "*.sql" ];
             };
           };
 
@@ -122,9 +144,12 @@
               with pkgs;
               [
                 gnumake
-                liburing
+                pgformatter
               ]
-              ++ [ config.packages.default ];
+              ++ [ config.packages.default ]
+              ++ pkgs.lib.optionalAttrs pkgs.stdenv.isLinux [
+                liburing
+              ];
 
             languages.elixir = {
               enable = true;
