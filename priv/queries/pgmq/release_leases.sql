@@ -5,5 +5,5 @@
 -- released.
 -- $1: queue name
 SELECT
-    pgmq_release_leases ($1) AS released;
+    ergon.pgmq_release_leases ($1) AS released;
 

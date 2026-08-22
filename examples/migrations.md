@@ -1,107 +1,130 @@
-# Migration helpers
+# Migration Helpers
 
-`import Ergon.Migration` in any Ecto migration to reuse the exact PostgreSQL
-patterns Ergon is built on: extensions, the shared versioning trigger, bi-temporal
-tables, property-graph vertex/edge tables, pgmq queues, and partition lifecycle
-functions. Each helper calls `Ecto.Migration.execute/{1,2}` directly, so it
-behaves like native Ecto DSL, reversible in `change/0` where it can be.
+Two separate things: running your migrations alongside Ergon's, and generating DDL that reuses Ergon's PostgreSQL patterns for your own tables.
 
-## A representative setup migration
+## Ergon's own schema
 
-```elixir
-defmodule MyApp.Repo.Migrations.Setup do
-  use Ecto.Migration
-  import Ergon.Migration
+Ergon installs its schema itself, from `.sql` files under `priv/migrations/`, applied by `migraterl`:
 
-  def change do
-    extensions()                              # btree_gist + pgcrypto + pgmq + conditionally pg_cron
-    versioning_trigger()                      # shared temporal_versioning() function
-
-    bitemporal_table(:assets, "name text NOT NULL, state text NOT NULL DEFAULT 'idle'")
-    pgmq_queue(:asset_events)
-
-    partitioned_table(:asset_telemetry_pings, :recorded_at)
-  end
-end
+```erlang
+{ok, Summary} = ergon_migrate:migrate().
+%% dry run
+{ok, Plan} = ergon_migrate:plan().
+{ok, State} = ergon_migrate:status().
 ```
 
-## `extensions/0`
+The sources apply in a fixed order:
 
-Installs, idempotently, everything Ergon depends on:
+| Source | Class | Contents |
+|---|---|---|
+| `bootstrap/` | `once` | extensions, `CREATE SCHEMA ergon` |
+| `functions/` | `on_change` | routines the schema attaches as triggers |
+| `schema/` | `once` | tables, indexes, constraints, RLS, property graph |
+| `routines/` | `on_change` | routines that depend on the schema |
+| `cron/` | `always` | the notifier ticks |
 
-- **`btree_gist`**, required for temporal `WITHOUT OVERLAPS` keys.
-- **`pgcrypto`**, the IMMUTABLE `digest(…, 'sha256')` behind the generated
-  `fingerprint` column.
-- **`pgmq`**, durable queue transport for `Ergon.Pgmq.*`.
-- **`pg_cron`**, installed **only** when the current database matches
-  `cron.database_name`. pg_cron can be created in exactly one database per
-  cluster, so it's skipped elsewhere. This is what lets the same migration run
-  cleanly against dev (pg_cron present) and test (absent).
+`functions/` must precede `schema/` because the triggers there reference those functions. `routines/` must follow it, because `ergon.enqueue` names `ergon.jobs` as a return type and `ergon.notify_pending_jobs` has a `LANGUAGE sql` body that PostgreSQL validates at `CREATE` time.
 
-## `versioning_trigger/0` and `bitemporal_table/2`
+`on_change` is why every routine is `CREATE OR REPLACE`: editing a function body is an edit to its own file rather than a new migration.
 
-`versioning_trigger/0` installs the shared, column-agnostic
-`temporal_versioning()` function once per database. It inspects the firing table
-at run time and archives the `OLD` row into `<table>_history` by naming
-convention.
+## Running your migrations too
 
-`bitemporal_table/2` then creates a table with application-time (`valid_time`)
-and system-time versioning, its `_history` twin, a GiST index, and the trigger:
+Register your own directories, each under **its own schema/namespace**:
 
-```elixir
-versioning_trigger()   # once, in an early migration
-bitemporal_table(:assets, "name text NOT NULL, state text NOT NULL DEFAULT 'idle'")
+```erlang
+%% sys.config
+{ergon, [
+    {ergon_migrate, [
+        {extra_sources, [
+            #{namespace => ~"my_app",
+              sources => [{once, {priv, my_app, "migrations"}}]}
+        ]}
+    ]}
+]}
 ```
 
-The `id` comes from a bare sequence, not `GENERATED ALWAYS AS IDENTITY`: the
-temporal PK `(id, valid_time WITHOUT OVERLAPS)` means one entity legitimately
-spans several validity rows sharing one id.
+`ergon_migrate:migrate/0` then applies Ergon's namespace first and yours after, so a table of yours that references `ergon.jobs`, or attaches `ergon.temporal_versioning()` as a trigger, always finds them.
 
-> `bitemporal_table/2` does **not** call `versioning_trigger/0` for you, the
-> function must exist before the trigger is attached. Call it once in an early
-> migration, then `bitemporal_table/2` as many times as you like.
+The separate namespace is what makes this safe, `migraterl` journals every script under its **basename** and checks ordering against that journal, so sharing Ergon's namespace would put your filenames in competition with `000001..000015` for sort position, and a basename that happened to collide would mark your script as already applied without ever running it. Namespaces are independent journals with their own advisory lock, so number your scripts however you like.
 
-## Property-graph tables
+Source directories accept a bare path, `{priv, App, Sub}`, or `{app, App, Sub}`, the same forms `ergon_sql`'s `extra_roots` takes.
 
-Build DAGs over your own domain (mirroring what Ergon does for `ergon.jobs`):
+> [!WARNING]
+> `ergon_migrate:teardown/0` drops **only Ergon's** schema, unlike `migrate/0` which applies everything. Your schema is not Ergon's to drop, and guessing at how to unwind it would be worse than not trying. Tear yours down first if you want a full reset.
 
-```elixir
-# Vertex tables, identity registries, one row per logical entity:
-vertex_table(:hub_vertices, references: {:id, :hubs})     # FK to a domain table
-vertex_table(:asset_vertices)                              # owns its identity
-vertex_table(:route_vertices, extra_columns: "code text NOT NULL UNIQUE")
+### Qualify your DDL
 
-# Edge tables, bi-temporal, with the _history twin and trigger:
-edge_table(:routes, {:from_id, :hub_vertices}, {:to_id, :hub_vertices},
-  check: "from_id <> to_id")   # ban self-loops
+Ergon connects as a role named `ergon`, and PostgreSQL's default `search_path` of `"$user", public` resolves `$user` to the **`ergon` schema**. So this:
+
+```sql
+-- Lands in the ergon schema
+CREATE TABLE assets (...);
 ```
 
-## pgmq queues
+creates your table inside Ergon's schema, where `teardown/0` will drop it along with everything else. Write `CREATE TABLE public.assets` (or your own schema), or set a `search_path` at the top of your migration.
 
-```elixir
-pgmq_queue(:telemetry_processing)        # reversible: down drops the queue
-pgmq_notify_cron(:telemetry_processing)  # the LISTEN fast-path tick
+The same cascade catches a host table that *depends* on an Ergon type, such as a column typed `ergon.job_state` or a foreign key into an Ergon table. That is ordinary `DROP SCHEMA ... CASCADE` behaviour rather than something Ergon chooses, but it surprises people, so it is worth saying twice.
+
+## Generating DDL
+
+`ergon_migration` returns SQL as `iodata` and executes nothing. Write the output to a `.sql` file in a directory you registered above, and it is applied and journalled like any other migration.
+
+```erlang
+SQL = ergon_migration:script(
+        ergon_migration:bitemporal_table_sql(~"assets", ~"name text NOT NULL, tag text")),
+ok = file:write_file("priv/migrations/000001_assets.sql", SQL).
 ```
 
-See [pgmq + Broadway](pgmq-broadway.md) for the consumer side, and
-[Scheduling](scheduling.md) for why the notify path is a cron tick.
+### Bi-Temporal Tables
 
-## Partition lifecycle
+The pattern `ergon.jobs` itself uses: two periods, a history twin, and a versioning trigger.
 
-`partitioned_table/2` installs an `auto_manage_partitions_<table>()` function
-that creates missing monthly partitions, and schedules it weekly via pg_cron:
-
-```elixir
-partitioned_table(:asset_telemetry_pings, :recorded_at)
+```erlang
+ergon_migration:bitemporal_table_sql(~"assets", ~"name text NOT NULL")
 ```
 
-The **parent** table (`CREATE TABLE … PARTITION BY RANGE (…)`) is yours to
-create, the host owns the schema. Pair this with `Ergon.PartitionBootCheck` in
-your supervision tree so partitions are verified at boot (see
-[Operations](operations.md#boot-time-partition-safety)).
+`valid_time` is application time, when the row is true in the world, split by `UPDATE ... FOR PORTION OF`. `system_time` is belief time, maintained by the trigger, with superseded rows archived into `assets_history`. The primary key is temporal: an id is unique at any instant, but one id may own many non-overlapping historical versions.
 
-## Everything is guarded
+The history twin is created with `LIKE ... INCLUDING DEFAULTS INCLUDING CONSTRAINTS`, deliberately **not** including indexes or generated columns. **History is an append-only log** the trigger writes verbatim, so a generated column there would refuse the write and a copied temporal primary key would reject the very overlaps history exists to record.
 
-The pg_cron-dependent helpers are no-ops where pg_cron isn't installed, so the
-same migration runs cleanly in dev (extensions active) and test (pg_cron absent
-by design). See [Scheduling](scheduling.md) for the guard mechanism.
+You can attach versioning to an existing table on its own:
+
+```erlang
+ergon_migration:history_twin_sql(~"assets"),
+ergon_migration:versioning_trigger_sql(~"assets")
+```
+
+The function it attaches, `ergon.temporal_versioning()`, is installed by Ergon and is column-agnostic: it inspects the firing table at run time and finds the history twin by naming convention. You define nothing.
+
+### Property Graph element tables
+
+```erlang
+ergon_migration:vertex_table_sql(
+    ~"hub_vertices", 
+    #{references => {~"id", ~"hubs"}}
+),
+ergon_migration:vertex_table_sql(
+    ~"route_vertices", 
+    #{extra_columns => ~"code text NOT NULL UNIQUE"}
+),
+ergon_migration:edge_table_sql(
+    ~"routes", 
+    {~"from_id", ~"hub_vertices"}, {~"to_id", ~"hub_vertices"},
+    #{check => ~"from_id <> to_id"}
+)
+```
+
+One lesson from Ergon's own graph is worth repeating: whatever a vertex table's key is, it must be **unique**. `ergon.workflow` originally keyed on `ergon.jobs (id)`, which is not unique under a temporal primary key, and every historical version of a job became its own vertex, which quietly broke every readiness query. Point the graph at a view filtered to live rows when the underlying table is bi-temporal.
+
+### Partitioned tables
+
+```erlang
+ergon_migration:partitioned_table_sql(~"telemetry", ~"recorded_at"),
+ergon_migration:partition_lifecycle_sql(~"telemetry")
+```
+
+The first emits `auto_manage_partitions_telemetry(months_ahead int DEFAULT 2)`, which creates any missing monthly partitions named `telemetry_YYYYMM`, plus one call to establish the initial horizon. The second schedules a weekly cron job to keep that horizon ahead of ingestion.
+
+**The parent table is not created for you.** `CREATE TABLE ... PARTITION BY RANGE` is yours, because the column list is.
+
+Three things call the emitted function, which is why it exists rather than being inlined: the initial call, the weekly cron job, and [`ergon_partition_boot_check`](operations.md#partition-safety-at-boot).

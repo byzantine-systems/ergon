@@ -1,12 +1,16 @@
-# Elixir / Mix
+# Erlang / rebar3
 /_build/
-/cover/
-/deps/
 /doc/
-/.fetch
+rebar3.crashdump
 erl_crash.dump
 *.ez
 *.beam
+.rebar3/
+
+# Elixir / Mix (removed as the port lands; kept until lib/ and mix.exs go)
+/cover/
+/deps/
+/.fetch
 /config/*.secret.exs
 .elixir_ls/
 
@@ -17,3 +21,6 @@ erl_crash.dump
 # Misc
 .env
 *.tar
+
+# nix build output
+/result

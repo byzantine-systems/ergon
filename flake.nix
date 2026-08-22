@@ -47,16 +47,39 @@
           ...
         }:
         let
-          mixConfig = builtins.readFile ./mix.exs;
-          stripped = pkgs.lib.replaceStrings [ " " "\t" "\n" "\r" ] [ "" "" "" "" ] mixConfig;
-          # mix.exs declares `version: "x.y.z"` in project/0; once whitespace is
-          # stripped that reads `version:"x.y.z"`. builtins.match anchors on the
-          # whole string, so the surrounding `.*` swallow everything else and the
-          # sole capture group is the version. Bracket expressions keep the
-          # literal `:` / `"` unambiguous under POSIX ERE.
-          m = builtins.match ''.*version:"([^"]+)".*'' stripped;
+          appSrc = builtins.readFile ./src/ergon.app.src;
+          stripped = pkgs.lib.replaceStrings [ " " "\t" "\n" "\r" ] [ "" "" "" "" ] appSrc;
+          # ergon.app.src declares `{vsn, "x.y.z"}`; once whitespace is stripped
+          # that reads `{vsn,"x.y.z"}`. builtins.match anchors on the whole
+          # string, so the surrounding `.*` swallow everything else and the sole
+          # capture group is the version. The braces go in bracket expressions
+          # because POSIX ERE, which builtins.match uses, gives `{` its own
+          # meaning as an interval quantifier and rejects `\{` as an escape.
+          m = builtins.match ''.*[{]vsn,"([^"]+)"[}].*'' stripped;
           app_name = "ergon";
           app_version = builtins.elemAt m 0;
+
+          # `lib.cleanSource` strips VCS noise but keeps everything else, and
+          # devenv's postgres leaves a unix socket at
+          # .devenv/state/postgres/.s.PGSQL.5432. Nix cannot copy a socket into
+          # the store, so evaluation fails outright with "has an unsupported
+          # type" whenever the database is running, which is to say on every
+          # development machine. Filter those trees out explicitly.
+          src = pkgs.lib.cleanSourceWith {
+            src = pkgs.lib.cleanSource ./.;
+            name = "${app_name}-source";
+            filter =
+              path: _type:
+              let
+                base = baseNameOf path;
+              in
+              !(builtins.elem base [
+                ".devenv"
+                ".direnv"
+                "_build"
+                ".git"
+              ]);
+          };
 
           # nixpkgs' pg_cron (1.6.7) fails to compile against the PG19
           # server headers with -Wtypedef-redefinition. Upstream commit
@@ -92,17 +115,42 @@
         in
         {
           packages = {
-            default = pkgs.beamPackages.mixRelease {
-              pname = app_name;
+            # Ergon is a library, so the artifact is a compiled OTP application
+            # rather than a release: nothing consumes a self-contained node with
+            # its own ERTS, and `nix build` earns its place as a compile gate.
+            # deps.nix is generated from rebar.lock by the rebar3_nix plugin,
+            # which is in the devShell:
+            #
+            #   rebar3 nix lock -o deps.nix
+            #
+            # Regenerate it after any dependency change. nixpkgs has no
+            # single fixed-output fetcher for rebar3 the way it does for mix:
+            # `fetchRebar3Deps` exists but nothing consumes it, and buildRebar3
+            # takes only a `beamDeps` list. Generating that list beats writing
+            # nine derivations by hand and keeping their hashes in step.
+            # `name`, not `pname`: buildRebar3 derives pname from it and builds
+            # its own store name as erlang<ver>-<name>-<version>.
+            default = pkgs.beamPackages.buildRebar3 {
+              name = app_name;
               version = app_version;
-              src = pkgs.lib.cleanSource ./.;
-              mixFodDeps = pkgs.beamPackages.fetchMixDeps {
-                pname = "mix-deps-${app_name}";
-                src = pkgs.lib.cleanSource ./.;
-                version = app_version;
-                hash = "sha256-iZK2VqFYOOQqnC1cNdMf6YZMKnIAktuczXyuhGpfmBQ=";
-                mixEnv = "prod";
-              };
+              inherit src;
+              buildPlugins = [ pkgs.beamPackages.pc ];
+              beamDeps = builtins.attrValues (
+                import ./rebar-deps.nix {
+                  inherit (pkgs.beamPackages) fetchHex;
+                  inherit (pkgs) fetchgit fetchFromGitHub;
+                  # Without a builder, deps.nix returns bare sources. Passing
+                  # buildRebar3 is what turns each entry into a compiled OTP app.
+                  #
+                  # Wrapped rather than passed directly so every dependency gets
+                  # the port compiler: `fs`, reached through migraterl, declares
+                  # `pc` in its own rebar.config and fails to compile without it.
+                  # Setting buildPlugins on the top-level app alone does not
+                  # reach the dependency derivations.
+                  builder =
+                    args: pkgs.beamPackages.buildRebar3 (args // { buildPlugins = [ pkgs.beamPackages.pc ]; });
+                }
+              );
             };
           };
 
@@ -111,6 +159,7 @@
             projectRootFile = "flake.nix";
             programs = {
               nixfmt.enable = true;
+              erlfmt.enable = true;
             };
 
             # pgFormatter ships no treefmt-nix `programs.*` wrapper, so register
@@ -145,14 +194,19 @@
               [
                 gnumake
                 pgformatter
+                rebar3
               ]
-              ++ [ config.packages.default ]
               ++ pkgs.lib.optionalAttrs pkgs.stdenv.isLinux [
                 liburing
               ];
 
-            languages.elixir = {
+            # Pinned rather than left to devenv's default: the Erlang tree uses
+            # OTP-28-only syntax (strict generators `<:-`, EEP-69 nominal types)
+            # alongside OTP-27 sigils and `maybe`. An implicit bump would break
+            # the build in ways that read as unrelated syntax errors.
+            languages.erlang = {
               enable = true;
+              package = pkgs.erlang_28;
               lsp.enable = true;
             };
 
@@ -199,10 +253,10 @@
                 # Point it at the app's dev DB so `CREATE EXTENSION pg_cron`
                 # and cron.schedule() operate on app tables (default is
                 # "postgres"). The value must match the dev DB name (`ergon`,
-                # per runtime.exs / .env), `current_database() =
+                # the PGDATABASE default), `current_database() =
                 # current_setting('cron.database_name', true)` is the guard
-                # `Ergon.Migration.extensions/0` uses to skip pg_cron creation
-                # in other databases (e.g. the test DB).
+                # priv/migrations/bootstrap uses to skip pg_cron creation in
+                # other databases (e.g. the test DB).
                 "cron.database_name" = "${app_name}";
                 "auto_explain.log_min_duration" = 150;
                 "auto_explain.log_analyze" = true;

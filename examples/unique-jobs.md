@@ -1,59 +1,95 @@
 # Unique jobs
 
-Ergon deduplicates jobs in the database, not the application. A unique job hashes
-its `(queue, worker, payload)` into a `fingerprint`, and duplicates collide on
-the temporal constraint:
+Deduplication enforced by the database, not by application bookkeeping.
+
+## The problem
+
+Two requests arrive at once and both enqueue "send the welcome email to user 42". Checking for an existing job first does not help: two processes can both check, both see nothing, and both insert. Closing that race in application code means a lock, and a lock means somewhere to put it.
+
+## The mechanism
+
+```erlang
+Job = ergon_new_job:unique_for(
+    ergon_new_job:new(~"welcome_email", #{~"user" => 42}),
+    60
+),
+
+{ok, First}  = ergon:enqueue(Job),
+{ok, Second} = ergon:enqueue(Job),
+
+%% same job, inserted once
+true = maps:get(id, First) =:= maps:get(id, Second).
+```
+
+The second call is not an error. It returns the **incumbent**, which is usually what a caller wants: "make sure this work is queued" rather than "insert a row".
+
+Three pieces make that work, and it is worth being precise about them because they are easy to describe wrongly.
+
+### The fingerprint is deterministic and unsalted
+
+`ergon.jobs.fingerprint` is a generated column:
 
 ```sql
-UNIQUE (fingerprint, valid_period WITHOUT OVERLAPS)
+fingerprint text GENERATED ALWAYS AS (
+    encode(digest(length(queue)::text || ':' || queue || ':' ||
+                  length(worker)::text || ':' || worker || ':' ||
+                  payload::text, 'sha256'), 'hex')) STORED
 ```
 
-Because the uniqueness window is *temporal*, "unique" always means "unique for a
-period of time" rather than "unique forever". That maps cleanly onto the real
-requirement, one welcome email per user per hour, one nightly report per day,
-without a separate dedup table or a Redis lock.
+Generated in the database so it can never disagree with the columns it summarises, and length-prefixed so `(queue, worker)` pairs cannot be confused by concatenation. **Nothing is salted.** Two jobs with the same queue, worker and payload always have the same fingerprint, whether or not either is unique.
 
-## Making a job unique
+### Uniqueness comes from the dedup window
 
-Add `unique_for/2` with the window length in seconds:
+What differs between a unique job and a non-unique one is `dedup_period`:
 
-```elixir
-Ergon.NewJob.new("nightly_report", %{date: Date.utc_today()})
-|> Ergon.NewJob.unique_for(3600)   # one delivery per hour
-|> Ergon.enqueue()
+- `unique_for(Job, N)` gives a bounded window, `[now, now + N seconds)`.
+- A non-unique job gets `'empty'`.
+
+Empty ranges never overlap anything, including other empty ranges. So duplicates of a non-unique job coexist happily while sharing a fingerprint.
+
+### The constraint is a partial EXCLUDE
+
+```sql
+CONSTRAINT jobs_unique_fingerprint
+EXCLUDE USING gist (
+    (coalesce(tenant, '')) WITH =,
+    fingerprint WITH =,
+    dedup_period WITH &&)
+WHERE (upper(valid_period) = 'infinity')
 ```
 
-Enqueuing a second job with the same fingerprint inside that window is rejected
-by PostgreSQL's temporal unique constraint, the deduplication is enforced by the
-database, so it holds even across nodes and concurrent enqueues racing the same
-instant.
+Not a `UNIQUE` constraint: PostgreSQL cannot express "these are equal and those overlap" as one, which is exactly what temporal deduplication needs.
 
-## The default is *not* unique
+The `WHERE` clause is important. Without it the constraint would collide with `FOR PORTION OF`: a state transition leaves a superseded row carrying the same fingerprint and the same `dedup_period`, and the split would conflict with itself. Restricting to live rows lets history accumulate freely.
 
-A non-unique job (the default from `Ergon.NewJob.new/2`) salts its fingerprint
-with random bytes, so two otherwise-identical enqueues never collide:
+`coalesce(tenant, '')` scopes uniqueness per tenant while still applying to rows with no tenant.
 
-```elixir
-# These are two distinct jobs, even with identical payloads:
-Ergon.NewJob.new("send_email", %{to: "alice@example.com"}) |> Ergon.enqueue()
-Ergon.NewJob.new("send_email", %{to: "alice@example.com"}) |> Ergon.enqueue()
+## Why the window is separate from validity
+
+A job has two periods, and conflating them would break one or the other:
+
+- `valid_period` is when the row is true in the world. It runs to `infinity` until a state transition closes it.
+- `dedup_period` is only about uniqueness.
+
+If uniqueness were keyed on `valid_period`, a unique job would stop being checkoutable the moment its dedup window expired, because the two would be the same range. Keeping them separate means a unique job stays runnable for its whole life while only being *undeduplicated* after its window closes.
+
+## How the incumbent is returned
+
+`ergon.enqueue` catches the exclusion violation and selects the live overlapping row instead:
+
+```sql
+-- (...)
+EXCEPTION
+    WHEN exclusion_violation THEN
+        RETURN QUERY
+        SELECT * FROM ergon.jobs
+        WHERE fingerprint = ... AND upper(valid_period) = 'infinity';
 ```
 
-Modelling uniqueness as `:not_unique | {:unique_for, seconds}` (rather than a
-boolean plus a nullable duration) makes the invalid states, "unique but no
-window", "not unique but has a window", unrepresentable.
+Which is why the second `enqueue` returns a job rather than an error, and why that job carries the first one's id.
 
-## Choosing the window
+## Choosing a window
 
-The fingerprint covers the payload, so put the deduplication key *in* the
-payload. Two enqueues collide only when queue, worker, **and** payload all match.
+The window is how long "the same job" means "already queued". Too short and a retry storm enqueues duplicates, too long and a genuinely new request is swallowed by an old one.
 
-```elixir
-# Deduplicated per user per day: include the date in the payload.
-Ergon.NewJob.new("daily_digest", %{user_id: 42, date: Date.utc_today()})
-|> Ergon.NewJob.unique_for(86_400)
-|> Ergon.enqueue()
-```
-
-If you leave the volatile part out of the payload, every enqueue in the window
-collapses to one job; if you include it, each distinct value is its own job.
+A reasonable rule: at least as long as the work takes, plus the retry budget. Size the budget on the *worst* case rather than the typical one, because backoff is jittered and the typical case is about half of it. For a job with 20 attempts on the defaults the ceilings add up to a little under 24 minutes, of which any given run will spend around 12; a window shorter than the full 24 can admit a duplicate while the original is still retrying.

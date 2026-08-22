@@ -21,8 +21,14 @@ jobs:
         with:
           hatchet-protocol: 'cleave'
 
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@v35
+
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
 
       # To leverage devenv inside Github Actions
       - uses: cachix/cachix-action@v17
@@ -30,10 +36,59 @@ jobs:
           name: devenv
 
       # TODO: Wait until sqruff properly supports GRAPH_TABLE (PG19)
-      # - name: "[Nix] Run treefmt to check Nix"
-      #   run: |
-      #     nix flake check
+      - name: "[Nix] Run treefmt to check Nix"
+        run: |
+          nix flake check
 
       - name: "[Nix] Build"
         run: |
           nix build
+
+      # The devenv shell is the only working way to get PostgreSQL 19 with the
+      # patched pg_cron and pgmq together: the official postgres image ships
+      # none of the three, and nixpkgs' pg_cron does not compile against the
+      # PG19 headers without the pin in flake.nix. So this is a devenv process
+      # rather than a `services:` container.
+      #
+      # `--impure` because the shell reads PWD to locate its state directory.
+      - name: "[DB] Start PostgreSQL"
+        run: |
+          nix develop --impure --command devenv up --detach
+
+      # devenv reports the supervisor as up before postgres finishes its own
+      # startup, and initdb on a cold runner is not instant. Poll the socket
+      # rather than sleeping a guessed interval.
+      - name: "[DB] Wait for readiness"
+        run: |
+          nix develop --impure --command bash -c '
+            for i in $(seq 1 60); do
+              if pg_isready -h 127.0.0.1 -p 5432 -q; then
+                echo "ready after ${i}s"; exit 0
+              fi
+              sleep 1
+            done
+            echo "postgres did not become ready"; exit 1
+          '
+
+      # ergon_test_db:setup/0 creates and migrates ergon_test on first use, so
+      # there is no separate migration step here. It is deliberately a different
+      # database from the dev one: pg_cron can only be installed where
+      # cron.database_name points, and running the suite without it is what
+      # tests the guard in priv/migrations/bootstrap.
+      - name: "[Test] Common Test"
+        run: |
+          nix develop --impure --command rebar3 ct
+
+      - name: "[Test] Dialyzer"
+        run: |
+          nix develop --impure --command rebar3 dialyzer
+
+      # The suite's own logs are the only useful artefact when a case fails on a
+      # runner nobody can attach to.
+      - name: "[Test] Upload logs"
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct-logs
+          path: _build/test/logs/
+          retention-days: 7

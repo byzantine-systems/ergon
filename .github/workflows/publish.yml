@@ -20,21 +20,39 @@ jobs:
         with:
           hatchet-protocol: 'cleave'
 
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@v35
+
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
 
       # To leverage devenv inside Github Actions
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
-      - name: "[Mix] Build the package's documentation"
+      # ex_doc renders the -moduledoc/-doc attributes (EEP-59) directly from
+      # the compiled beams, so the docs are the module docs, not a second copy.
+      - name: "[Docs] Build the package's documentation"
         run: |
-          nix develop --impure --command mix docs
+          nix develop --impure --command rebar3 compile
+          nix develop --impure --command ex_doc \
+            "ergon" \
+            "$(sed -n 's/.*{vsn, *"\([^"]*\)".*/\1/p' src/ergon.app.src)" \
+            "_build/default/lib/ergon/ebin" \
+            --proglang erlang \
+            --main readme \
+            --extra README.md \
+            --source-url "https://github.com/byzantine-systems/ergon" \
+            --source-ref "${GITHUB_REF_NAME}" \
+            --output doc
 
       - name: Upload pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
-          path: build/dev/docs/eparch/
+          path: doc/
 
   deploy-docs:
     runs-on: ubuntu-latest
@@ -58,10 +76,18 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v7
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@v35
 
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      # rebar3_hex is fetched on demand rather than pinned in the devShell:
+      # it is needed only here, and only on a version tag.
       - name: Publish to Hex
-        run: nix develop --impure --command mix hex.publish --yes
+        run: nix develop --impure --command rebar3 as publish hex publish --yes
         env:
           HEX_API_KEY: ${{ secrets.HEXPM_API_KEY }}
