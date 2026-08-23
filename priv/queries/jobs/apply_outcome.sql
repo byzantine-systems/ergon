@@ -5,9 +5,14 @@
 -- state. History is preserved for auditing rather than being overwritten in
 -- place. Only the live row (upper(valid_period) = 'infinity') is affected.
 --
--- On a retry (new state 'available') scheduled_at is pushed out by a capped
--- quadratic backoff computed from the attempt count ($3): 1s, 4s, 9s, ... up to
--- 100s. Other transitions leave scheduled_at untouched. The legality of the
+-- On a retry (new state 'available') scheduled_at is pushed out by
+-- ergon.retry_backoff, a jittered capped exponential taking the attempt count
+-- ($3) and its tuning from ergon_db: base milliseconds ($5), cap milliseconds
+-- ($6), and strategy ($7). See that function for the formulas and where they
+-- come from. Other transitions leave scheduled_at untouched.
+--
+-- now() stays the anchor, so the timestamp is still the database's and still
+-- transaction-frozen; only the offset carries the jitter. The legality of the
 -- transition itself is enforced by the jobs_transition_guard trigger.
 UPDATE
     ergon.jobs FOR PORTION OF valid_period
@@ -19,7 +24,7 @@ SET
     attempt = $3,
     last_error = $4,
     scheduled_at = CASE WHEN $2 = 'available' THEN
-        NOW() + MAKE_INTERVAL(secs => POWER(least ($3, 10), 2))
+        NOW() + ergon.retry_backoff ($3, $5, $6, $7)
     ELSE
         scheduled_at
     END

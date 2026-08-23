@@ -1,0 +1,22 @@
+{application, ergon, [
+    {description,
+        "PostgreSQL-native background job and workflow processing, built on "
+        "PostgreSQL 19 temporal tables, SQL/PGQ property graphs, pgmq durable "
+        "queues, and pg_cron scheduling."},
+    {vsn, "0.2.0"},
+    {registered, [ergon_sup, ergon_sql]},
+    {mod, {ergon_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        crypto,
+        pgo,
+        migraterl,
+        worker_pool,
+        backoff
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["LGPL-3.0-only"]},
+    {links, [{"GitHub", "https://github.com/byzantine-systems/ergon"}]}
+]}.

@@ -1,85 +1,103 @@
 # Workflows and DAG dependencies
 
-Ergon resolves job dependencies with a PostgreSQL SQL/PGQ **property graph** (PG
-19), not recursive CTEs or an application-side scheduler. Jobs are vertices,
-dependency edges connect them, and "what is ready to run?" is a single
-`GRAPH_TABLE`/`MATCH` query.
+Job dependencies that are enforced by checkout, not merely queryable.
 
 ## Declaring a dependency
 
-`Ergon.depends_on/2` adds a `triggers` edge: the child runs only after the parent
-completes.
+```erlang
+{ok, #{id := Build}}  = ergon:enqueue(ergon_new_job:new(~"build")),
+{ok, #{id := Deploy}} = ergon:enqueue(ergon_new_job:new(~"deploy")),
 
-```elixir
-{:ok, build}  = Ergon.enqueue(Ergon.NewJob.new("build"))
-{:ok, deploy} = Ergon.enqueue(Ergon.NewJob.new("deploy"))
-
-:ok = Ergon.depends_on(build.id, deploy.id)
+ok = ergon:depends_on(Build, Deploy).
 ```
 
-Until `build` completes, `deploy` is blocked and won't appear as ready:
+`deploy` is now **withheld from checkout** until `build` completes. Not merely absent from a readiness query: a worker draining that queue will not be handed it, and `ergon_db:checkout/2` will not return it.
 
-```elixir
-# deploy is not ready yet, build hasn't completed:
-{:ok, []} = Ergon.ready_children()
+```erlang
+{ok, []} = ergon:ready_children(),   %% deploy is not ready
+{ok, Jobs} = ergon_db:checkout(~"default", 10),
+[~"build"] = [W || #{worker := W} <- Jobs].
 ```
 
-## Asking what is ready
-
-Two queries answer the scheduling question from different angles:
-
-```elixir
-# Every job whose parents have all completed, across the whole graph:
-{:ok, ids} = Ergon.ready_children()
-
-# The jobs a specific completed parent directly unblocks:
-{:ok, ids} = Ergon.unblocked_by(build.id)
-```
-
-`ready_children/0` is the graph-wide view, a worker loop can drain it to pick up
-newly runnable work. `unblocked_by/1` is the local view, useful right after a
-job completes, to see exactly what it freed.
+Once `build` reaches `completed`, `deploy` becomes checkoutable on the next poll.
 
 ## Fan-out and fan-in
 
-Edges compose into arbitrary DAGs. A job is ready only when **all** of its
-parents have completed, which gives you fan-in for free:
+Edges compose into arbitrary DAGs, and a job is released only when **all** of its parents have completed:
 
-```elixir
-{:ok, lint}    = Ergon.enqueue(Ergon.NewJob.new("lint"))
-{:ok, test}    = Ergon.enqueue(Ergon.NewJob.new("test"))
-{:ok, release} = Ergon.enqueue(Ergon.NewJob.new("release"))
+```erlang
+{ok, #{id := Lint}}    = ergon:enqueue(ergon_new_job:new(~"lint")),
+{ok, #{id := Test}}    = ergon:enqueue(ergon_new_job:new(~"test")),
+{ok, #{id := Release}} = ergon:enqueue(ergon_new_job:new(~"release")),
 
-# release waits for BOTH lint and test:
-:ok = Ergon.depends_on(lint.id, release.id)
-:ok = Ergon.depends_on(test.id, release.id)
+ok = ergon:depends_on(Lint, Release),
+ok = ergon:depends_on(Test, Release).
 ```
+
+## How the blocking works
+
+Each job carries `pending_parents`, a count of its parents that have not completed, maintained by two triggers: one on `ergon.job_edges` for links added and removed, one on `ergon.jobs` for a parent reaching `completed`.
+
+That count lives in the fetch index's predicate:
+
+```sql
+CREATE INDEX jobs_fetch_idx ON ergon.jobs (queue, scheduled_at)
+WHERE state = 'available'
+  AND upper(valid_period) = 'infinity'
+  AND pending_parents = 0;
+```
+
+So a blocked job is not merely filtered out of checkout, it is **absent from the index**. That matters more than it sounds. Expressing the same rule as a join against `job_edges` leaves `LIMIT` bounding the output but not the scan, and the index walk has to step over every blocked job ahead of the first runnable one. 
+
+## A failed parent blocks its children indefinitely
+
+Only `completed` releases a child. A parent that ends `failed` or `discarded` never completes, so its children stay blocked until someone intervenes.
+
+That is the honest reading of a dependency: the workflow is stuck and wants an operator, not a child that runs as though its prerequisite had succeeded. Two ways out:
+
+```erlang
+%% see what is stuck
+#{jobs := #{~"default" := #{blocked := N}}} = ergon_health:check(),
+
+%% tear the subtree down deliberately
+{ok, Discarded} = ergon:cancel(Build).
+```
+
+`ergon:cancel/1` cascades to every descendant still in a cancellable state, discarding each through a proper valid-time transition so history is preserved. Terminal descendants are left alone.
+
+## Asking what the graph is doing
+
+Two queries, both observability rather than scheduling, since checkout already excludes anything blocked:
+
+```erlang
+%% every job whose parents have all completed
+{ok, Ids} = ergon:ready_children(),
+
+%% what a specific completed parent directly released
+{ok, Ids} = ergon:unblocked_by(Build).
+```
+
+Both run over the `ergon.workflow` property graph with a single `GRAPH_TABLE` match. Multi-hop reachability, such as the cascade behind `cancel/1`, uses a recursive CTE instead: PG19's SQL/PGQ has no path quantifiers, so variable-length reachability cannot be expressed in `MATCH` at all.
+
+`ready_children/0` is also a useful cross-check on `pending_parents`, because the two answer the same question through entirely independent mechanisms: a graph match against a trigger-maintained counter. Persistent disagreement means one of them is wrong, which is what `ergon_reconciler:drift/0` exists to detect.
+
+## Cycles are rejected
+
+```erlang
+ok = ergon:depends_on(A, B),
+{error, would_create_cycle} = ergon:depends_on(B, A),
+{error, would_create_cycle} = ergon:depends_on(A, A).
+```
+
+The check runs in the database as a recursive reachability query, inside a transaction and behind a transaction-scoped advisory lock. The lock is not decoration: under READ COMMITTED two concurrent calls adding opposite edges would each evaluate reachability against a snapshot taken before the other's insert, both see no cycle, and both commit.
 
 ## Labelled edges
 
-`depends_on/2` is `triggers` by convention. For richer graphs, add your own edge
-labels with `link/3`:
+`depends_on/2` adds a `triggers` edge. For richer graphs, label your own:
 
-```elixir
-:ok = Ergon.link(parent.id, child.id, "triggers")
-:ok = Ergon.link(parent.id, child.id, "notifies")
+```erlang
+ok = ergon:link(Parent, Child, ~"triggers"),
+ok = ergon:link(Parent, Child, ~"notifies").
 ```
 
-## Cancelling a subtree
-
-Cancelling a job cascades to every descendant still running or waiting, and
-returns the jobs actually discarded:
-
-```elixir
-{:ok, discarded} = Ergon.cancel(build.id)
-# build plus everything downstream that hadn't finished
-```
-
-This is a graph traversal in the database, so a deep dependency tree is torn down
-in one call rather than N round-trips.
-
-## How to model the schema
-
-The graph is built from vertex and edge tables. Ergon ships its own for
-`ergon.jobs`, but you can build parallel graphs over your domain tables with the
-[migration helpers](migrations.md) (`vertex_table/2`, `edge_table/4`).
+Only `triggers` participates in blocking.
