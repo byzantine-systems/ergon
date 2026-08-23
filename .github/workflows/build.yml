@@ -17,9 +17,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # nix-quick-install-action installs single-user as the runner user, so it
+      # bails out if /nix is not writeable. nothing-but-nix creates /nix owned by
+      # root, which suited the old DeterminateSystems installer (it runs under
+      # sudo) but not this one, hence the permission edict.
       - uses: wimpysworld/nothing-but-nix@main
         with:
           hatchet-protocol: 'cleave'
+          nix-permission-edict: true
 
       - name: Install Nix
         uses: nixbuild/nix-quick-install-action@v35
