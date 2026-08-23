@@ -56,9 +56,15 @@ jobs:
       # rather than a `services:` container.
       #
       # `--impure` because the shell reads PWD to locate its state directory.
+      #
+      # `--detached`, not `--detach`: devenv forwards these flags to
+      # process-compose, which rejects the latter but leaves devenv exiting 0,
+      # so a typo here starts nothing and still shows a green step.
+      # Beware `-d`, which is process-compose's --hide-disabled; the short form
+      # of --detached is -D.
       - name: "[DB] Start PostgreSQL"
         run: |
-          nix develop --impure --command devenv up --detach
+          nix develop --impure --command devenv up --detached
 
       # devenv reports the supervisor as up before postgres finishes its own
       # startup, and initdb on a cold runner is not instant. Poll the socket
