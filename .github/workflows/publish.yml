@@ -40,19 +40,26 @@ jobs:
 
       # ex_doc renders the -moduledoc/-doc attributes (EEP-59) directly from
       # the compiled beams, so the docs are the module docs, not a second copy.
+      #
+      # Going through the rebar3_ex_doc plugin rather than calling the ex_doc
+      # escript by hand, for three reasons.
+      #
+      # It works at all: `ex_doc` is not on the devShell PATH, so the direct
+      # invocation this replaces could only ever have exited 127.
+      #
+      # It is the same input as hexdocs: the plugin reads the {ex_doc, ...}
+      # block in rebar.config, which is what `hex publish` renders from in the
+      # publish-to-hex job below. Hand-passing flags here meant Pages got
+      # `--extra README.md` alone while hexdocs got all eight examples pages --
+      # two doc sites, one tag, different contents.
+      #
+      # It derives the arguments this step used to compute: the app name and
+      # ebin path come from the project, --source-ref from {vsn, ...} with a `v`
+      # prefix (prefix_ref_vsn_with_v, default true), which is exactly the tag
+      # that triggered this workflow -- so GITHUB_REF_NAME is no longer read,
+      # and the vsn-scraping sed is gone. Output still lands in doc/.
       - name: "[Docs] Build the package's documentation"
-        run: |
-          nix develop --impure --command rebar3 compile
-          nix develop --impure --command ex_doc \
-            "ergon" \
-            "$(sed -n 's/.*{vsn, *"\([^"]*\)".*/\1/p' src/ergon.app.src)" \
-            "_build/default/lib/ergon/ebin" \
-            --proglang erlang \
-            --main readme \
-            --extra README.md \
-            --source-url "https://github.com/byzantine-systems/ergon" \
-            --source-ref "${GITHUB_REF_NAME}" \
-            --output doc
+        run: nix develop --impure --command rebar3 ex_doc
 
       - name: Upload pages artifact
         uses: actions/upload-pages-artifact@v5

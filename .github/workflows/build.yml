@@ -49,6 +49,15 @@ jobs:
         run: |
           nix build
 
+      # warnings_as_errors cannot live in the default profile: rebar3 compiles a
+      # hex dependency with that dependency's own erl_opts, so shipping it would
+      # let any new OTP warning break every downstream build. It lives in the
+      # `check` profile instead, which makes the warning gate this explicit step
+      # rather than a side effect of `nix build`.
+      - name: "[Lint] Compile with warnings as errors"
+        run: |
+          nix develop --impure --command rebar3 as check compile
+
       # The devenv shell is the only working way to get PostgreSQL 19 with the
       # patched pg_cron and pgmq together: the official postgres image ships
       # none of the three, and nixpkgs' pg_cron does not compile against the
